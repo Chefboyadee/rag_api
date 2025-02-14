@@ -5,6 +5,7 @@ import numpy as np
 import openai
 from sentence_transformers import SentenceTransformer
 from fastapi.middleware.cors import CORSMiddleware
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Load the data
 import os
@@ -45,12 +46,28 @@ def query_rag(
     query: str = Query(..., description="Your search query"),
     session_id: str = Query(None, description="Session ID for context persistence")
 ):
-    query_embedding = model.encode(query)
-    query_embedding = np.array([query_embedding], dtype=np.float32)
+    query_embedding = model.encode(query).reshape(1, -1)
 
     # Search in FAISS
-    D, I = index.search(query_embedding, k=5)
+    D, I = index.search(np.float32(query_embedding), k=5)
     retrieved_texts = df.iloc[I[0]]["sentence_chunk"].tolist()
+    retrieved_embeddings = np.stack(df.iloc[I[0]]["embedding"].values)
+
+    # Calculate cosine similarities
+    similarities = cosine_similarity(query_embedding, retrieved_embeddings)[0]
+    max_similarity = max(similarities) if similarities.size > 0 else 0
+
+    # Check similarity threshold
+    threshold = 0.4  # Adjust based on experimentation
+    if max_similarity < threshold:
+        return {
+            "query": query,
+            "retrieved_texts": retrieved_texts,
+            "generated_response": "Sorry, I don't know how to answer that based on the available information.",
+            "session_id": session_id
+        }
+
+    # Prepare context and call OpenAI if relevant context is found
     context = "\n".join(retrieved_texts)
 
     # Maintain conversation history
@@ -59,17 +76,16 @@ def query_rag(
             session_histories[session_id] = []
         session_histories[session_id].append({"role": "user", "content": query})
 
-        # Add past messages to context
-        conversation_history = session_histories[session_id][-5:]  # Limit to last 5 exchanges
+        conversation_history = session_histories[session_id][-5:]
     else:
         conversation_history = []
 
-    # Construct messages for OpenAI
-    messages = [{"role": "system", "content": "You are an assistant that provides answers based on retrieved documents."}]
-    messages.extend(conversation_history)  # Include past exchanges
-    messages.append({"role": "user", "content": f"Context: {context}\n\nQuery: {query}"})
+    messages = [
+        {"role": "system", "content": "You are an assistant that answers based only on the provided context. If the context is irrelevant, say you don't know."},
+        *conversation_history,
+        {"role": "user", "content": f"Context: {context}\n\nQuery: {query}"}
+    ]
 
-    # Generate response
     response = openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages
@@ -77,13 +93,14 @@ def query_rag(
 
     ai_response = response.choices[0].message.content
 
-    # Store AI response in history
     if session_id:
         session_histories[session_id].append({"role": "assistant", "content": ai_response})
 
     return {
         "query": query,
         "retrieved_texts": retrieved_texts,
+        "similarity_scores": similarities.tolist(),
         "generated_response": ai_response,
         "session_id": session_id
     }
+
